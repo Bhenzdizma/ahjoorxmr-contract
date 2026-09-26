@@ -4103,6 +4103,74 @@ fn set_escrow_oracle_price(s: &OracleEscrowSetup, price: i128, ts: u64) {
 }
 
 #[test]
+fn test_collateral_health_tracks_deposit_and_oracle_ratio() {
+    let s = setup_oracle_escrow();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1_000);
+    s.token_admin_client.mint(&seller, &1_000);
+
+    let escrow_id = s.client.create_multi_seller_escrow(
+        &buyer,
+        &Vec::from_array(&s.env, [(seller.clone(), 10_000)]),
+        &arbiter,
+        &500,
+        &s.token_addr,
+        &(s.env.ledger().timestamp() + 1_000),
+        &None,
+        &2_000u32,
+        &0u32,
+        &1_000u64,
+    );
+    s.client.deposit_collateral(&seller, &escrow_id);
+    s.client.set_collateral_health_config(&buyer, &escrow_id, &1_500u32, &s.oracle_addr);
+
+    // The 100 collateral units are worth their face value at the default
+    // 1:1 oracle price, so the health ratio is 2,000 bps.
+    set_escrow_oracle_price(&s, 10_000_000, 100);
+    assert_eq!(s.client.check_collateral_health(&escrow_id), 2_000);
+    assert_eq!(s.client.get_collateral_health_status(&escrow_id), CollateralHealthStatus::Healthy);
+}
+
+#[test]
+fn test_collateral_health_detects_price_drop_and_top_up_restores_ratio() {
+    let s = setup_oracle_escrow();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1_000);
+    s.token_admin_client.mint(&seller, &1_000);
+
+    let escrow_id = s.client.create_multi_seller_escrow(
+        &buyer,
+        &Vec::from_array(&s.env, [(seller.clone(), 10_000)]),
+        &arbiter,
+        &500,
+        &s.token_addr,
+        &(s.env.ledger().timestamp() + 1_000),
+        &None,
+        &2_000u32,
+        &0u32,
+        &1_000u64,
+    );
+    s.client.deposit_collateral(&seller, &escrow_id);
+    s.client.set_collateral_health_config(&buyer, &escrow_id, &1_500u32, &s.oracle_addr);
+
+    // A 0.5x price makes 100 collateral worth 50 against a 500 escrow:
+    // 1,000 bps, below the configured 1,500 bps minimum.
+    set_escrow_oracle_price(&s, 5_000_000, 100);
+    assert_eq!(s.client.check_collateral_health(&escrow_id), 1_000);
+    assert_eq!(s.client.get_escrow(&escrow_id).status, EscrowStatus::UnderCollateralized);
+
+    // The top-up path uses the collateral units directly and restores the
+    // configured ratio even while the escrow is under-collateralized.
+    s.client.top_up_collateral(&seller, &escrow_id, &250);
+    assert_eq!(s.client.get_escrow(&escrow_id).status, EscrowStatus::Active);
+    assert_eq!(s.client.get_collateral_health_status(&escrow_id), CollateralHealthStatus::Healthy);
+}
+
+#[test]
 fn test_oracle_release_triggers_when_price_below_threshold() {
     let s = setup_oracle_escrow();
 
