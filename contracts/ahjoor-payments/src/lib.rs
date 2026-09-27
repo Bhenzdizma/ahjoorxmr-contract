@@ -3409,6 +3409,16 @@ impl AhjoorPaymentsContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    /// Returns the configured invoice-count cap for a merchant (#887).
+    /// Returns (period_ledgers, max_count) = (0, 0) if no cap has been set.
+    pub fn get_max_invoices_per_period(env: Env, merchant: Address) -> (u32, u32) {
+        env.storage()
+            .persistent()
+            .get::<DataKey3, InvoiceCountCap>(&DataKey3::InvoiceCountCap(merchant))
+            .map(|c| (c.period_ledgers, c.max_count))
+            .unwrap_or((0, 0))
+    }
+
     /// Returns the current invoice-count window for a merchant (#804).
     /// Merchants without a configured cap return a zeroed window.
     pub fn get_invoice_count_window(env: Env, merchant: Address) -> InvoiceCountWindow {
@@ -4481,6 +4491,22 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the current payment expiry bounds as (min_seconds, max_seconds) (#885).
+    /// Defaults to (DEFAULT_MIN_PAYMENT_EXPIRY, DEFAULT_MAX_PAYMENT_EXPIRY) if never configured.
+    pub fn get_payment_expiry_bounds(env: Env) -> (u64, u64) {
+        let min = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinPaymentExpiry)
+            .unwrap_or(DEFAULT_MIN_PAYMENT_EXPIRY);
+        let max = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxPaymentExpiry)
+            .unwrap_or(DEFAULT_MAX_PAYMENT_EXPIRY);
+        (min, max)
     }
 
     pub fn get_min_payment_expiry(env: Env) -> u64 {
@@ -6147,6 +6173,16 @@ impl AhjoorPaymentsContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    /// Returns the merchant-specific withdrawal limit as (window_seconds, cap) (#886).
+    /// Returns (0, 0) if no merchant-specific limit has been configured.
+    pub fn get_withdrawal_limit(env: Env, merchant: Address) -> (u64, i128) {
+        env.storage()
+            .persistent()
+            .get::<DataKey2, WithdrawalLimit>(&DataKey2::MerchantWithdrawalLimit(merchant))
+            .map(|l| (l.window_seconds, l.cap))
+            .unwrap_or((0, 0))
+    }
+
     /// Admin overrides a merchant's withdrawal cap (emergency override).
     pub fn override_withdrawal_limit(env: Env, admin: Address, merchant: Address, cap: i128) {
         Self::require_not_paused(&env);
@@ -6213,6 +6249,22 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the global default withdrawal limits as (window_seconds, cap) (#884).
+    /// Defaults to (86400, i128::MAX) if never explicitly configured.
+    pub fn get_default_withdrawal_limits(env: Env) -> (u64, i128) {
+        let window_seconds = env
+            .storage()
+            .instance()
+            .get(&DataKey2::WithdrawalWindowSeconds)
+            .unwrap_or(86400u64);
+        let cap = env
+            .storage()
+            .instance()
+            .get(&DataKey2::WithdrawalWindowCap)
+            .unwrap_or(i128::MAX);
+        (window_seconds, cap)
     }
 
     pub fn get_withdrawal_rate_limit(env: Env, merchant: Address) -> (u64, i128) {
@@ -11060,5 +11112,9 @@ mod test;
 
 #[cfg(test)]
 mod test_appeal_rejection_cooldown;
+mod test_get_withdrawal_limit;
+mod test_get_max_invoices_per_period;
+mod test_get_default_withdrawal_limits;
+mod test_get_payment_expiry_bounds;
 
 pub use events::*;
