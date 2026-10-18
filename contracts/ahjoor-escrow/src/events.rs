@@ -1840,3 +1840,72 @@ pub struct ArbiterRecused {
 pub fn emit_arbiter_recused(e: &Env, escrow_id: u32, old_arbiter: Address, new_arbiter: Address, reason_hash: BytesN<32>) {
     ArbiterRecused { escrow_id, old_arbiter, new_arbiter, reason_hash }.publish(e);
 }
+
+// ── Keeper: Merchant Response Reminders ──────────────────────────────────────
+
+/// Event: A partial-release request is approaching its response deadline.
+/// Emitted once per request (per keeper call) within the configured reminder
+/// window.  Off-chain systems listen for this to notify the seller.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantResponseDue {
+    /// Escrow that contains the pending partial-release request.
+    pub escrow_id: u32,
+    /// Unique identifier of the request that is approaching its deadline.
+    pub request_id: u64,
+    /// Address of the seller who requested the partial release.
+    pub seller: Address,
+    /// Unix timestamp of the response deadline.
+    pub response_deadline: u64,
+    /// Unix timestamp when this reminder was emitted.
+    pub reminded_at: u64,
+}
+
+pub fn emit_merchant_response_due(
+    e: &Env,
+    escrow_id: u32,
+    request_id: u64,
+    seller: Address,
+    response_deadline: u64,
+    reminded_at: u64,
+) {
+    MerchantResponseDue {
+        escrow_id,
+        request_id,
+        seller,
+        response_deadline,
+        reminded_at,
+    }
+    .publish(e);
+}
+
+// ── Buyer Unilateral Deadline Extension ──────────────────────────────────────
+
+/// Event: Buyer extended the escrow deadline without requiring seller sign-off.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DeadlineExtendedByBuyer {
+    pub escrow_id: u32,
+    pub buyer: Address,
+    pub old_deadline: u64,
+    pub new_deadline: u64,
+    pub extended_at: u64,
+}
+
+pub fn emit_deadline_extended_by_buyer(
+    e: &Env,
+    escrow_id: u32,
+    buyer: Address,
+    old_deadline: u64,
+    new_deadline: u64,
+    extended_at: u64,
+) {
+    DeadlineExtendedByBuyer {
+        escrow_id,
+        buyer,
+        old_deadline,
+        new_deadline,
+        extended_at,
+    }
+    .publish(e);
+}
