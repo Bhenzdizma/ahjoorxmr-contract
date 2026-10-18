@@ -748,6 +748,8 @@ pub enum DataKey {
     DisputeDeadlineStart(u32),
     /// Counter tracking arbiter timeout occurrences per arbiter
     ArbiterTimeoutCount(Address),
+    /// Per-arbiter concurrent active dispute count
+    ArbiterActiveDisputeCount(Address),
     /// Token whitelist contract address
     TokenWhitelistContract,
     /// #215: time-lock metadata per escrow

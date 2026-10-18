@@ -17,7 +17,7 @@ pub trait TokenWhitelistInterface {
     fn remove_token(env: Env, admin: Address, token: Address);
     
     /// Get all whitelisted tokens
-    fn get_whitelisted_tokens(env: Env) -> soroban_sdk::Vec<Address>;
+    fn get_whitelisted_tokens(env: Env, offset: u32, limit: u32) -> soroban_sdk::Vec<Address>;
     
     /// Get the current admin
     fn get_admin(env: Env) -> Address;
@@ -35,6 +35,7 @@ pub trait TokenWhitelistInterface {
         token: Address,
         max_volume_per_period: i128,
         period_ledgers: u32,
+        max_per_transaction: Option<i128>,
     );
 
     /// Update token quota (admin only)
@@ -44,6 +45,7 @@ pub trait TokenWhitelistInterface {
         token: Address,
         max_volume_per_period: i128,
         period_ledgers: u32,
+        max_per_transaction: Option<i128>,
     );
 
     /// Remove token quota (admin only)
@@ -80,7 +82,8 @@ pub trait TokenWhitelistInterface {
     fn get_suspension_history(
         env: Env,
         token: Address,
-        offset: u32,
-        limit: u32,
-    ) -> soroban_sdk::Vec<crate::SuspensionRecord>;
+    ) -> soroban_sdk::Vec<crate::SuspensionHistoryEntry>;
+
+    /// Get whitelist version for cache invalidation
+    fn get_whitelist_version(env: Env) -> u64;
 }
