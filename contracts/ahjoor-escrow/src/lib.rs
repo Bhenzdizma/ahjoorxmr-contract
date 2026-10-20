@@ -607,6 +607,8 @@ pub struct Dispute {
     pub resolved: bool,
     pub dispute_amount: i128,
     pub timeout_seconds: Option<u64>,
+    pub filing_fee: i128,
+    pub filing_party: Address,
 }
 
 /// #571: Insurance claim details recorded for an escrow.
