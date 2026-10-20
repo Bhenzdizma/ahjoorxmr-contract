@@ -18,6 +18,12 @@ const DEFAULT_MAX_TOPUP_MULTIPLIER: u32 = 3;
 const DEFAULT_PARTIAL_RELEASE_RESPONSE_DEADLINE: u64 = 86400; // 1 day
 /// #574: max number of status-transition entries retained per escrow; oldest are pruned.
 const MAX_STATUS_HISTORY_ENTRIES: u32 = 20;
+/// Default keeper reminder window: 1 hour before the response deadline.
+const DEFAULT_REMINDER_WINDOW_SECONDS: u64 = 3_600;
+/// Default cap on a single buyer `extend_deadline` call: 30 days.
+const DEFAULT_MAX_DEADLINE_EXTENSION_SECONDS: u64 = 30 * 24 * 60 * 60;
+/// Maximum number of escrow IDs accepted in one `emit_response_reminders` call.
+const MAX_REMINDER_BATCH_SIZE: u32 = 50;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8922,6 +8928,272 @@ impl AhjoorEscrowContract {
             .unwrap_or(0)
     }
 
+    // ── Keeper: Merchant Response Reminders ──────────────────────────────────
+
+    /// Keeper function — scan a batch of escrow IDs and emit a
+    /// [`MerchantResponseDue`] event for every escrow that has a pending
+    /// partial-release request whose `response_deadline` falls within the
+    /// configured reminder window.
+    ///
+    /// # Rules
+    /// * Batch size is capped at `MAX_REMINDER_BATCH_SIZE` (default 50).
+    /// * At most **one** reminder per request_id is ever emitted (de-duplication
+    ///   via `DataKey3::ReminderSent`).
+    /// * Escrows that have already been resolved / are terminal are silently
+    ///   skipped — no error.
+    /// * Escrows with no pending request are silently skipped.
+    /// * Callable by **anyone** — no auth required (permissionless keeper).
+    pub fn emit_response_reminders(env: Env, escrow_ids: Vec<u32>) {
+        Self::require_not_paused(&env);
+
+        if escrow_ids.len() > MAX_REMINDER_BATCH_SIZE {
+            panic_with_error!(&env, EscrowErrorExt5::ReminderBatchTooLarge);
+        }
+
+        let reminder_window: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::ReminderWindowSeconds)
+            .unwrap_or(DEFAULT_REMINDER_WINDOW_SECONDS);
+
+        let now = env.ledger().timestamp();
+
+        for escrow_id in escrow_ids.iter() {
+            // Load the escrow; silently skip if it doesn't exist.
+            let escrow: Escrow = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Escrow(escrow_id))
+            {
+                Some(e) => e,
+                None => continue,
+            };
+
+            // Skip terminal escrows — nothing to remind about.
+            if Self::is_terminal_escrow_status(escrow.status) {
+                continue;
+            }
+
+            // Load the pending partial-release request; skip if absent.
+            let request: PartialReleaseRequest = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::PendingPartialRelease(escrow_id))
+            {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Skip if the deadline has already passed — it's too late to remind.
+            if now >= request.response_deadline {
+                continue;
+            }
+
+            // Only remind when we're inside the reminder window.
+            // i.e.  response_deadline - reminder_window <= now < response_deadline
+            if now < request.response_deadline.saturating_sub(reminder_window) {
+                continue;
+            }
+
+            // De-duplicate: skip if we already emitted a reminder for this
+            // specific request_id on this escrow.
+            let already_sent: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey3::ReminderSent(escrow_id))
+                .unwrap_or(0);
+
+            if already_sent == request.request_id {
+                continue;
+            }
+
+            // Mark reminder as sent before emitting (prevents re-entry).
+            env.storage()
+                .persistent()
+                .set(&DataKey3::ReminderSent(escrow_id), &request.request_id);
+            env.storage().persistent().extend_ttl(
+                &DataKey3::ReminderSent(escrow_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            events::emit_merchant_response_due(
+                &env,
+                escrow_id,
+                request.request_id,
+                escrow.seller,
+                request.response_deadline,
+                now,
+            );
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the request_id for which a `MerchantResponseDue` reminder was
+    /// last sent on `escrow_id`, or `0` if no reminder has been sent yet.
+    pub fn get_reminder_sent(env: Env, escrow_id: u32) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::ReminderSent(escrow_id))
+            .unwrap_or(0)
+    }
+
+    // ── Buyer Unilateral Deadline Extension ───────────────────────────────────
+
+    /// Let the **buyer** extend the escrow deadline in one step without going
+    /// through the two-party amendment flow.
+    ///
+    /// Because extending a deadline only benefits the seller (more time to
+    /// deliver), the seller's consent is not required.
+    ///
+    /// # Rules
+    /// * Caller must be the escrow buyer.
+    /// * `new_deadline` must be strictly after the current deadline **and**
+    ///   after `now`.
+    /// * The extension (`new_deadline - current_deadline`) must not exceed
+    ///   the configured cap (`DataKey3::MaxDeadlineExtensionSeconds`,
+    ///   default 30 days).
+    /// * Rejected if the escrow is in an active dispute
+    ///   (`Disputed` / `PartiallyDisputed`).
+    /// * Rejected if the escrow is in a terminal state.
+    pub fn extend_deadline(env: Env, buyer: Address, escrow_id: u32, new_deadline: u64) {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        // Auth: only the buyer may call this unilateral path.
+        if buyer != escrow.buyer {
+            panic_with_error!(&env, EscrowErrorExt5::OnlyBuyerCanExtendDeadline);
+        }
+
+        // Reject terminal escrows.
+        if Self::is_terminal_escrow_status(escrow.status) {
+            panic_with_error!(&env, EscrowErrorExt::EscrowAlreadyTerminal);
+        }
+
+        // Reject during active disputes — deadline semantics change under dispute.
+        if escrow.status == EscrowStatus::Disputed
+            || escrow.status == EscrowStatus::PartiallyDisputed
+        {
+            panic_with_error!(&env, EscrowErrorExt5::CannotExtendDeadlineDuringDispute);
+        }
+
+        let now = env.ledger().timestamp();
+
+        // new_deadline must be strictly in the future.
+        if new_deadline <= now {
+            panic_with_error!(&env, EscrowErrorExt5::NewDeadlineMustBeInFuture);
+        }
+
+        // new_deadline must be strictly after the current deadline (never move earlier).
+        if new_deadline <= escrow.deadline {
+            panic_with_error!(&env, EscrowErrorExt5::NewDeadlineMustBeInFuture);
+        }
+
+        // Enforce the extension cap.
+        let max_extension: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::MaxDeadlineExtensionSeconds)
+            .unwrap_or(DEFAULT_MAX_DEADLINE_EXTENSION_SECONDS);
+
+        let extension_amount = new_deadline - escrow.deadline;
+        if extension_amount > max_extension {
+            panic_with_error!(&env, EscrowErrorExt5::DeadlineExtensionExceedsCap);
+        }
+
+        let old_deadline = escrow.deadline;
+        escrow.deadline = new_deadline;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_deadline_extended_by_buyer(
+            &env,
+            escrow_id,
+            buyer,
+            old_deadline,
+            new_deadline,
+            now,
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // ── Admin: configure reminder window and deadline extension cap ───────────
+
+    /// Set the keeper reminder window in seconds.
+    /// Reminders are emitted when `now >= response_deadline - window`.
+    /// Callable by admin only.
+    pub fn set_reminder_window(env: Env, admin: Address, window_seconds: u64) {
+        Self::require_not_paused(&env);
+        Self::require_admin(&env, &admin);
+
+        if window_seconds == 0 {
+            panic_with_error!(&env, EscrowErrorExt::TimeoutMustBePositive);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey3::ReminderWindowSeconds, &window_seconds);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Read the currently configured reminder window in seconds.
+    pub fn get_reminder_window(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey3::ReminderWindowSeconds)
+            .unwrap_or(DEFAULT_REMINDER_WINDOW_SECONDS)
+    }
+
+    /// Set the maximum single-call deadline extension (seconds) that the buyer
+    /// is permitted to apply via `extend_deadline`.
+    /// Callable by admin only.
+    pub fn set_max_deadline_extension(env: Env, admin: Address, max_seconds: u64) {
+        Self::require_not_paused(&env);
+        Self::require_admin(&env, &admin);
+
+        if max_seconds == 0 {
+            panic_with_error!(&env, EscrowErrorExt::TimeoutMustBePositive);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey3::MaxDeadlineExtensionSeconds, &max_seconds);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Read the currently configured maximum deadline extension in seconds.
+    pub fn get_max_deadline_extension(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey3::MaxDeadlineExtensionSeconds)
+            .unwrap_or(DEFAULT_MAX_DEADLINE_EXTENSION_SECONDS)
+    }
+
     // --- Internal Helpers ---
 
     fn require_not_paused(env: &Env) {
@@ -11158,3 +11430,9 @@ mod test_fee_sponsorship;
 
 #[cfg(test)]
 mod test_escrow_template;
+
+#[cfg(test)]
+mod test_response_reminders;
+
+#[cfg(test)]
+mod test_extend_deadline;
