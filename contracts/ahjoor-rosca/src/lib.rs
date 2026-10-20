@@ -49,6 +49,7 @@ mod penalty_waiver;
 mod round_extension;
 pub mod savings_goal_tracking;
 pub mod savings_goal_tracking_impl;
+mod hardship;
 mod streak;
 mod succession;
 mod vesting;
@@ -932,7 +933,16 @@ impl AhjoorContract {
             .get(&DataKey2::MemberTiers)
             .unwrap_or(Map::new(&env));
         let tier_bps = tiers.get(contributor.clone()).unwrap_or(10_000); // Default to 1x (10000 bps)
-        let member_required_amount = (base_amount * tier_bps as i128) / 10_000;
+        // #1030: an approved hardship reduction lowers this round's requirement.
+        let member_required_amount = hardship::required_for(
+            &env,
+            &contributor,
+            env.storage()
+                .instance()
+                .get(&DataKey::CurrentRound)
+                .unwrap_or(0),
+            (base_amount * tier_bps as i128) / 10_000,
+        );
 
         let amount_to_transfer = if token == base_token {
             amount // For base token, transfer the exact amount specified
@@ -9474,7 +9484,15 @@ impl AhjoorContract {
             .get(&DataKey2::MemberTiers)
             .unwrap_or(Map::new(&env));
         let tier_bps = tiers.get(member.clone()).unwrap_or(10_000);
-        let member_required_amount = (base_amount * tier_bps as i128) / 10_000;
+        let member_required_amount = hardship::required_for(
+            &env,
+            &member,
+            env.storage()
+                .instance()
+                .get(&DataKey::CurrentRound)
+                .unwrap_or(0),
+            (base_amount * tier_bps as i128) / 10_000,
+        );
 
         let mut member_contributions: Map<Address, i128> = env
             .storage()

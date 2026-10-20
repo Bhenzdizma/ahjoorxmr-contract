@@ -37,6 +37,9 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
         .instance()
         .get(&DataKey::CurrentRound)
         .unwrap();
+    // #1030: settle hardship earmarks first so a covered shortfall is part of
+    // this round's pot.
+    hardship::settle_round(env, current_round);
     let payout_order: Vec<Address> = env.storage().instance().get(&DataKey::PayoutOrder).unwrap();
     let suspended_members: Vec<Address> = env
         .storage()
@@ -306,6 +309,7 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
                 && vesting::vesting_ledgers(env) > 0
             {
                 vesting::vest_payout(env, &payout_recipient, payout_amount, current_round);
+                record_member_payout(env, &payout_recipient, current_round, &token_addr, payout_amount);
             } else if payout_amount > 0 {
                 // Transfer payout to the nominated beneficiary, or the recipient
                 // themselves when no beneficiary is set.
@@ -315,6 +319,7 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
                     .get(&DataKey5::PayoutBeneficiary(payout_recipient.clone()))
                     .unwrap_or(payout_recipient.clone());
                 client.transfer(&env.current_contract_address(), &payout_destination, &payout_amount);
+                record_member_payout(env, &payout_recipient, current_round, &token_addr, payout_amount);
                 events::emit_payout_delivered(
                     env,
                     current_round,
@@ -835,7 +840,17 @@ pub(crate) fn apply_prepaid_for_member(env: &Env, member: &Address) {
         .get(&DataKey2::MemberTiers)
         .unwrap_or(Map::new(env));
     let tier_bps = tiers.get(member.clone()).unwrap_or(10_000);
-    let member_required = (contribution_amount * tier_bps as i128) / 10_000;
+    let current_round: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::CurrentRound)
+        .unwrap_or(0);
+    let member_required = hardship::required_for(
+        env,
+        member,
+        current_round,
+        (contribution_amount * tier_bps as i128) / 10_000,
+    );
     if member_required <= 0 {
         return;
     }
@@ -882,11 +897,6 @@ pub(crate) fn apply_prepaid_for_member(env: &Env, member: &Address) {
         .instance()
         .set(&DataKey::PaidMembers, &next_paid);
 
-    let current_round: u32 = env
-        .storage()
-        .instance()
-        .get(&DataKey::CurrentRound)
-        .unwrap_or(0);
     events::emit_prepaid_consumed(env, member.clone(), current_round, remaining_needed);
 }
 

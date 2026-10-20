@@ -82,8 +82,10 @@ pub trait TokenWhitelistInterface {
     fn get_suspension_history(
         env: Env,
         token: Address,
-    ) -> soroban_sdk::Vec<crate::SuspensionHistoryEntry>;
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<crate::SuspensionRecord>;
 
-    /// Get whitelist version for cache invalidation
-    fn get_whitelist_version(env: Env) -> u64;
+    /// Check if a token is usable (combined whitelist, suspension, deprecation, and quota check)
+    fn is_token_usable(env: Env, token: Address) -> bool;
 }

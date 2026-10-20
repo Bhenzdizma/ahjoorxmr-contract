@@ -288,5 +288,71 @@ pub fn emit_token_suspended_by_guardian(e: &Env, token: Address, guardian: Addre
     TokenSuspendedByGuardian { token, guardian, expiry_ledger }.publish(e);
 }
 
+// ==================== TIMELOCKED REMOVAL EVENTS ====================
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TokenRemovalScheduled {
+    pub token: Address,
+    pub admin: Address,
+    pub removal_ledger: u32,
+    pub reason_hash: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TokenRemovalCancelled {
+    pub token: Address,
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TokenRemovedViaTimelock {
+    pub token: Address,
+    pub requester: Address,
+}
+
+pub fn emit_token_removal_scheduled(
+    e: &Env,
+    token: Address,
+    admin: Address,
+    removal_ledger: u32,
+    reason_hash: BytesN<32>,
+) {
+    TokenRemovalScheduled { token, admin, removal_ledger, reason_hash }.publish(e);
+}
+
+pub fn emit_token_removal_cancelled(e: &Env, token: Address, admin: Address) {
+    TokenRemovalCancelled { token, admin }.publish(e);
+}
+
+pub fn emit_token_removed_via_timelock(e: &Env, token: Address, requester: Address) {
+    TokenRemovedViaTimelock { token, requester }.publish(e);
+}
+
+// ==================== TOKEN CATEGORY EVENTS ====================
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TokenCategoryAssigned {
+    pub token: Address,
+    pub category: crate::TokenCategory,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TokenCategoryRemoved {
+    pub token: Address,
+}
+
+pub fn emit_token_category_assigned(e: &Env, token: Address, category: crate::TokenCategory) {
+    TokenCategoryAssigned { token, category }.publish(e);
+}
+
+pub fn emit_token_category_removed(e: &Env, token: Address) {
+    TokenCategoryRemoved { token }.publish(e);
+}
+
 #[allow(dead_code)]
 fn _use_symbol(_: Symbol) {}
