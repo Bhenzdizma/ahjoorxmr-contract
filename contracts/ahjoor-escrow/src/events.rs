@@ -1227,6 +1227,55 @@ pub fn emit_seller_marked_complete(e: &Env, escrow_id: u32, seller: Address) {
     SellerMarkedComplete { escrow_id, seller }.publish(e);
 }
 
+// ── #1062: Deadline Reminder Events ──────────────────────────────────────────
+
+/// Event: Emitted by `emit_deadline_reminders` when an escrow is approaching
+/// its deadline and has not yet received a reminder.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EscrowDeadlineApproaching {
+    pub escrow_id: u32,
+    pub deadline: u64,
+    pub ledger_timestamp: u64,
+}
+
+pub fn emit_escrow_deadline_approaching(e: &Env, escrow_id: u32, deadline: u64) {
+    EscrowDeadlineApproaching {
+        escrow_id,
+        deadline,
+        ledger_timestamp: e.ledger().timestamp(),
+    }
+    .publish(e);
+}
+
+// ── #1067: Arbiter Ruling Rationale Events ────────────────────────────────────
+
+/// Event: Arbiter verdict recorded (with rationale hash).
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ArbiterVerdictRecorded {
+    pub escrow_id: u32,
+    pub arbiter: Address,
+    pub buyer_percent: u32,
+    pub rationale_hash: BytesN<32>,
+}
+
+pub fn emit_arbiter_verdict_recorded(
+    e: &Env,
+    escrow_id: u32,
+    arbiter: Address,
+    buyer_percent: u32,
+    rationale_hash: BytesN<32>,
+) {
+    ArbiterVerdictRecorded {
+        escrow_id,
+        arbiter,
+        buyer_percent,
+        rationale_hash,
+    }
+    .publish(e);
+}
+
 pub fn emit_inspector_replaced(e: &Env, escrow_id: u32, old_inspector: Address, new_inspector: Address) {
     InspectorReplaced { escrow_id, old_inspector, new_inspector }.publish(e);
 }
@@ -1841,71 +1890,33 @@ pub fn emit_arbiter_recused(e: &Env, escrow_id: u32, old_arbiter: Address, new_a
     ArbiterRecused { escrow_id, old_arbiter, new_arbiter, reason_hash }.publish(e);
 }
 
-// ── Keeper: Merchant Response Reminders ──────────────────────────────────────
+// ── #586: Escrow Document Attachment Events ──────────────────────────────────
 
-/// Event: A partial-release request is approaching its response deadline.
-/// Emitted once per request (per keeper call) within the configured reminder
-/// window.  Off-chain systems listen for this to notify the seller.
+/// Event: A document hash was attached to an escrow by a party.
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct MerchantResponseDue {
-    /// Escrow that contains the pending partial-release request.
+pub struct DocumentAttached {
     pub escrow_id: u32,
-    /// Unique identifier of the request that is approaching its deadline.
-    pub request_id: u64,
-    /// Address of the seller who requested the partial release.
-    pub seller: Address,
-    /// Unix timestamp of the response deadline.
-    pub response_deadline: u64,
-    /// Unix timestamp when this reminder was emitted.
-    pub reminded_at: u64,
+    pub party: Address,
+    pub doc_hash: BytesN<32>,
+    pub kind: Symbol,
+    pub attached_at: u64,
 }
 
-pub fn emit_merchant_response_due(
+pub fn emit_document_attached(
     e: &Env,
     escrow_id: u32,
-    request_id: u64,
-    seller: Address,
-    response_deadline: u64,
-    reminded_at: u64,
+    party: Address,
+    doc_hash: BytesN<32>,
+    kind: Symbol,
+    attached_at: u64,
 ) {
-    MerchantResponseDue {
+    DocumentAttached {
         escrow_id,
-        request_id,
-        seller,
-        response_deadline,
-        reminded_at,
-    }
-    .publish(e);
-}
-
-// ── Buyer Unilateral Deadline Extension ──────────────────────────────────────
-
-/// Event: Buyer extended the escrow deadline without requiring seller sign-off.
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct DeadlineExtendedByBuyer {
-    pub escrow_id: u32,
-    pub buyer: Address,
-    pub old_deadline: u64,
-    pub new_deadline: u64,
-    pub extended_at: u64,
-}
-
-pub fn emit_deadline_extended_by_buyer(
-    e: &Env,
-    escrow_id: u32,
-    buyer: Address,
-    old_deadline: u64,
-    new_deadline: u64,
-    extended_at: u64,
-) {
-    DeadlineExtendedByBuyer {
-        escrow_id,
-        buyer,
-        old_deadline,
-        new_deadline,
-        extended_at,
+        party,
+        doc_hash,
+        kind,
+        attached_at,
     }
     .publish(e);
 }

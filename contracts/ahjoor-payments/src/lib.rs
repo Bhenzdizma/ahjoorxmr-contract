@@ -243,6 +243,12 @@ pub enum ExtError {
     NoPendingPayoutChange = 78,
     /// Capture deadline has passed; customer can no longer cancel (#803).
     CancelPastCaptureDeadline = 76,
+    /// #1051: rolling reserve bps must be <= 10_000 and need a non-zero hold.
+    InvalidRollingReserveConfig = 80,
+    /// #1051: merchant balance plus rolling reserve cannot cover the refund.
+    InsufficientRollingReserve = 81,
+    /// #1051: payment is not a completed, settled single-merchant payment.
+    PaymentNotSettled = 82,
 }
 
 /// Per-merchant withdrawal rate limit config (#231).
@@ -531,6 +537,20 @@ pub struct PaymentRequest {
     pub token: Address,
     pub reference: Option<String>,
     pub metadata: Option<Map<String, String>>,
+}
+
+/// Reusable merchant payment link with an optional use limit and expiry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReusablePaymentRequest {
+    pub request_id: u32,
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub max_uses: Option<u32>,
+    pub uses: u32,
+    pub expires_at: Option<u64>,
+    pub active: bool,
 }
 
 /// Consent record for zero-amount agreement signing (#307)
@@ -1154,6 +1174,12 @@ pub enum DataKey3 {
     PendingPayoutChange(Address),
     /// #981: Instance: delay in ledgers before a payout address change applies
     PayoutChangeDelayLedgers,
+    /// #1051: Persistent: merchant's rolling reserve config
+    RollingReserveConfig(Address),
+    /// #1051: Persistent: merchant's held reserve buckets (Vec<ReserveBucket>)
+    RollingReserveBuckets(Address),
+    /// #1051: Persistent: refunds drawn from the merchant's reserve (Vec<ReserveDrawdown>)
+    RollingReserveDrawdowns(Address),
 }
 
 /// #981: Pending time-locked payout address change.
@@ -1162,6 +1188,34 @@ pub enum DataKey3 {
 pub struct PendingPayoutChange {
     pub new_payout: Address,
     pub effective_ledger: u32,
+}
+
+/// #1051: Share of each settlement held back as a refund buffer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RollingReserveConfig {
+    pub bps: u32,
+    pub hold_ledgers: u32,
+}
+
+/// #1051: Reserve held from one settlement until `release_ledger`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveBucket {
+    pub token: Address,
+    pub amount: i128,
+    pub held_at_ledger: u32,
+    pub release_ledger: u32,
+}
+
+/// #1051: A refund that drew `amount` from the merchant's rolling reserve.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveDrawdown {
+    pub payment_id: u32,
+    pub token: Address,
+    pub amount: i128,
+    pub ledger: u32,
 }
 
 mod events;
@@ -1359,6 +1413,170 @@ impl AhjoorPaymentsContract {
     /// Accepts optional reference (max 64 bytes) and metadata (max 5 keys) (#67).
     /// Accepts optional idempotency_key to prevent duplicate payments.
     /// Returns the new payment ID.
+    pub fn create_payment_request(
+        env: Env,
+        merchant: Address,
+        token: Address,
+        amount: i128,
+        max_uses: Option<u32>,
+        expires_at: Option<u64>,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if amount <= 0 {
+            panic!("Payment amount must be positive");
+        }
+        if max_uses == Some(0) {
+            panic_with_error!(&env, ExtError::InvalidAmount);
+        }
+        if expires_at.is_some_and(|expiry| expiry <= env.ledger().timestamp()) {
+            panic_with_error!(&env, ExtError::PaymentRequestExpired);
+        }
+
+        Self::require_token_accepted(&env, &merchant, &token);
+        Self::require_merchant_approved(&env, &merchant);
+
+        let request_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::PaymentRequestCounter)
+            .unwrap_or(0);
+        let next_id = request_id
+            .checked_add(1)
+            .expect("Payment request counter overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey3::PaymentRequestCounter, &next_id);
+
+        let request = ReusablePaymentRequest {
+            request_id,
+            merchant,
+            token,
+            amount,
+            max_uses,
+            uses: 0,
+            expires_at,
+            active: true,
+        };
+        let key = DataKey3::PaymentRequest(request_id);
+        env.storage().persistent().set(&key, &request);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        request_id
+    }
+
+    /// Pay a reusable request, creating a normal escrow payment linked to it.
+    pub fn pay_request(env: Env, customer: Address, request_id: u32) -> u32 {
+        Self::require_not_paused(&env);
+        customer.require_auth();
+
+        let request_key = DataKey3::PaymentRequest(request_id);
+        let mut request: ReusablePaymentRequest = env
+            .storage()
+            .persistent()
+            .get(&request_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ExtError::PaymentRequestNotFound));
+
+        if !request.active {
+            panic_with_error!(&env, ExtError::PaymentRequestInactive);
+        }
+        if request
+            .expires_at
+            .is_some_and(|expiry| env.ledger().timestamp() >= expiry)
+        {
+            panic_with_error!(&env, ExtError::PaymentRequestExpired);
+        }
+        if request.max_uses.is_some_and(|max_uses| request.uses >= max_uses) {
+            panic_with_error!(&env, ExtError::PaymentRequestExhausted);
+        }
+
+        request.uses = request
+            .uses
+            .checked_add(1)
+            .expect("Payment request use counter overflow");
+        env.storage().persistent().set(&request_key, &request);
+        env.storage().persistent().extend_ttl(
+            &request_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let payment_id = Self::create_payment_with_expiry(
+            env.clone(),
+            customer,
+            request.merchant,
+            request.amount,
+            request.token,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let payment_link_key = DataKey3::PaymentRequestPayment(payment_id);
+        env.storage()
+            .persistent()
+            .set(&payment_link_key, &request_id);
+        env.storage().persistent().extend_ttl(
+            &payment_link_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        payment_id
+    }
+
+    /// Deactivate a reusable payment request. Only its merchant may do so.
+    pub fn deactivate_payment_request(env: Env, merchant: Address, request_id: u32) {
+        merchant.require_auth();
+        let key = DataKey3::PaymentRequest(request_id);
+        let mut request: ReusablePaymentRequest = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ExtError::PaymentRequestNotFound));
+        if request.merchant != merchant {
+            panic!("Only the payment request merchant can deactivate it");
+        }
+        request.active = false;
+        env.storage().persistent().set(&key, &request);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    /// Return a reusable payment request, or None if it does not exist.
+    pub fn get_payment_request(env: Env, request_id: u32) -> Option<ReusablePaymentRequest> {
+        let key = DataKey3::PaymentRequest(request_id);
+        let request = env.storage().persistent().get(&key);
+        if request.is_some() {
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        request
+    }
+
+    /// Return the request ID associated with a payment created by `pay_request`.
+    pub fn get_payment_request_for_payment(env: Env, payment_id: u32) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::PaymentRequestPayment(payment_id))
+    }
+
     pub fn create_payment(
         env: Env,
         customer: Address,
@@ -2011,8 +2229,14 @@ impl AhjoorPaymentsContract {
         // #231: Enforce withdrawal rate limit
         Self::check_and_update_withdrawal_rate_limit(&env, &merchant, net_amount);
 
+        // #1051: hold the merchant's rolling reserve share back on contract.
+        let reserve_hold = Self::hold_rolling_reserve(&env, &merchant, &settlement_token, net_amount);
+
         let token_client = token::Client::new(&env, &settlement_token);
-        token_client.transfer(&env.current_contract_address(), &Self::resolve_payout_address(&env, &merchant), &net_amount);
+        let payout_amount = net_amount - reserve_hold;
+        if payout_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &Self::resolve_payout_address(&env, &merchant), &payout_amount);
+        }
 
         if fee_collected > 0 {
             if let Some(fee_recipient) = env
@@ -5519,6 +5743,233 @@ impl AhjoorPaymentsContract {
             .get(&DataKey3::PendingPayoutChange(merchant))
     }
 
+    // ── #1051: Rolling reserve on merchant settlements ────────────────────────
+
+    /// Admin: hold `bps` of each of `merchant`'s settlements for
+    /// `hold_ledgers` ledgers as a refund and chargeback buffer. `bps = 0`
+    /// stops new holds; reserve already held still releases on schedule.
+    pub fn set_rolling_reserve(env: Env, merchant: Address, bps: u32, hold_ledgers: u32) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        if bps > 10_000 || (bps > 0 && hold_ledgers == 0) {
+            panic_with_error!(&env, ExtError::InvalidRollingReserveConfig);
+        }
+
+        let key = DataKey3::RollingReserveConfig(merchant.clone());
+        if bps == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&key, &RollingReserveConfig { bps, hold_ledgers });
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        events::emit_rolling_reserve_set(&env, merchant, bps, hold_ledgers);
+    }
+
+    pub fn get_rolling_reserve(env: Env, merchant: Address) -> Option<RollingReserveConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::RollingReserveConfig(merchant))
+    }
+
+    /// Reserve buckets currently held for `merchant`, oldest first.
+    pub fn get_rolling_reserve_buckets(env: Env, merchant: Address) -> Vec<ReserveBucket> {
+        Self::reserve_buckets(&env, &merchant)
+    }
+
+    /// Total reserve held for `merchant` in `token`, released or not yet due.
+    pub fn get_rolling_reserve_balance(env: Env, merchant: Address, token: Address) -> i128 {
+        let mut total: i128 = 0;
+        for bucket in Self::reserve_buckets(&env, &merchant).iter() {
+            if bucket.token == token {
+                total += bucket.amount;
+            }
+        }
+        total
+    }
+
+    /// Reserve held for `merchant` in `token` whose hold period has elapsed.
+    pub fn get_releasable_rolling_reserve(env: Env, merchant: Address, token: Address) -> i128 {
+        let now = env.ledger().sequence();
+        let mut total: i128 = 0;
+        for bucket in Self::reserve_buckets(&env, &merchant).iter() {
+            if bucket.token == token && bucket.release_ledger <= now {
+                total += bucket.amount;
+            }
+        }
+        total
+    }
+
+    /// Refunds that drew on `merchant`'s rolling reserve, oldest first.
+    pub fn get_rolling_reserve_drawdowns(env: Env, merchant: Address) -> Vec<ReserveDrawdown> {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::RollingReserveDrawdowns(merchant))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Pays every `token` bucket whose hold period has elapsed to the
+    /// merchant's payout address. Anyone may call. Returns the amount
+    /// released (0 when nothing is due yet).
+    pub fn release_rolling_reserve(env: Env, merchant: Address, token: Address) -> i128 {
+        Self::require_not_paused(&env);
+        let now = env.ledger().sequence();
+        let buckets = Self::reserve_buckets(&env, &merchant);
+        let mut kept: Vec<ReserveBucket> = Vec::new(&env);
+        let mut released: i128 = 0;
+        for bucket in buckets.iter() {
+            if bucket.token == token && bucket.release_ledger <= now {
+                released += bucket.amount;
+            } else {
+                kept.push_back(bucket);
+            }
+        }
+        if released == 0 {
+            return 0;
+        }
+        Self::save_reserve_buckets(&env, &merchant, &kept);
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &Self::resolve_payout_address(&env, &merchant),
+            &released,
+        );
+        events::emit_rolling_reserve_released(&env, merchant, token, released);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        released
+    }
+
+    /// Merchant refunds `amount` of a completed, settled payment to its
+    /// customer. The refund is paid from the merchant's own token balance
+    /// first; any shortfall is drawn from the merchant's rolling reserve in
+    /// that token (oldest buckets first, whether or not they are due) and
+    /// recorded as a `ReserveDrawdown`.
+    pub fn refund_settled_payment(env: Env, merchant: Address, payment_id: u32, amount: i128) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if amount <= 0 {
+            panic!("Refund amount must be positive");
+        }
+
+        let mut payment: Payment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .expect("Payment not found");
+        if payment.merchant != merchant {
+            panic!("Payment does not belong to merchant");
+        }
+        let settled: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Settled(payment_id))
+            .unwrap_or(false);
+        let is_split_payment = env
+            .storage()
+            .persistent()
+            .has(&DataKey3::SplitPayees(payment_id));
+        if payment.status != PaymentStatus::Completed || !settled || is_split_payment {
+            panic_with_error!(&env, ExtError::PaymentNotSettled);
+        }
+
+        let remaining = payment.amount - payment.refunded_amount;
+        if amount > remaining {
+            panic!("Refund amount exceeds remaining balance");
+        }
+
+        let token_client = token::Client::new(&env, &payment.token);
+        let from_merchant = amount.min(token_client.balance(&merchant).max(0));
+        let from_reserve = amount - from_merchant;
+
+        if from_reserve > 0 {
+            Self::draw_rolling_reserve(&env, &merchant, &payment.token, from_reserve);
+            let key = DataKey3::RollingReserveDrawdowns(merchant.clone());
+            let mut drawdowns: Vec<ReserveDrawdown> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(Vec::new(&env));
+            drawdowns.push_back(ReserveDrawdown {
+                payment_id,
+                token: payment.token.clone(),
+                amount: from_reserve,
+                ledger: env.ledger().sequence(),
+            });
+            env.storage().persistent().set(&key, &drawdowns);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            events::emit_rolling_reserve_drawn(
+                &env,
+                merchant.clone(),
+                payment_id,
+                payment.token.clone(),
+                from_reserve,
+            );
+        }
+
+        if from_merchant > 0 {
+            token_client.transfer(&merchant, &payment.customer, &from_merchant);
+        }
+        if from_reserve > 0 {
+            token_client.transfer(&env.current_contract_address(), &payment.customer, &from_reserve);
+        }
+
+        payment.refunded_amount += amount;
+        let old_status = payment.status;
+        if payment.refunded_amount >= payment.amount {
+            payment.status = PaymentStatus::Refunded;
+            // A fully refunded payment must not stay queued for withdrawal.
+            let queue = Self::get_withdrawal_queue(&env, &merchant);
+            let mut remaining_queue: Vec<(u32, i128)> = Vec::new(&env);
+            for entry in queue.iter() {
+                if entry.0 != payment_id {
+                    remaining_queue.push_back(entry);
+                }
+            }
+            Self::set_withdrawal_queue(&env, &merchant, remaining_queue);
+        }
+
+        Self::reverse_points_for_refund(&env, &payment.customer, amount, payment.amount);
+        Self::inc_global_refunded(&env, &payment.token, amount);
+        Self::inc_merchant_refunded(&env, &merchant, &payment.token, amount);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Payment(payment_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_settled_payment_refunded(&env, payment_id, merchant, amount, from_reserve);
+        if payment.status != old_status {
+            events::emit_payment_status_changed(&env, payment_id, old_status, payment.status);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
     /// Check if a token is allowed via the whitelist contract.
     /// Delegates to contract-level allowlist first, then global whitelist.
     pub fn is_token_allowed(env: Env, token: Address) -> bool {
@@ -6686,6 +7137,80 @@ impl AhjoorPaymentsContract {
             .unwrap_or(merchant.clone())
     }
 
+    fn reserve_buckets(env: &Env, merchant: &Address) -> Vec<ReserveBucket> {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::RollingReserveBuckets(merchant.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    fn save_reserve_buckets(env: &Env, merchant: &Address, buckets: &Vec<ReserveBucket>) {
+        let key = DataKey3::RollingReserveBuckets(merchant.clone());
+        if buckets.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, buckets);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+    }
+
+    /// #1051: records a reserve bucket of `bps` of `net_amount` for a
+    /// merchant with a rolling reserve configured and returns the amount held
+    /// (0 when none is configured). The held funds stay on contract.
+    fn hold_rolling_reserve(env: &Env, merchant: &Address, token: &Address, net_amount: i128) -> i128 {
+        let config: Option<RollingReserveConfig> = env
+            .storage()
+            .persistent()
+            .get(&DataKey3::RollingReserveConfig(merchant.clone()));
+        let config = match config {
+            Some(c) => c,
+            None => return 0,
+        };
+        let hold = (net_amount * config.bps as i128) / 10_000;
+        if hold <= 0 {
+            return 0;
+        }
+        let now = env.ledger().sequence();
+        let release_ledger = now.saturating_add(config.hold_ledgers);
+        let mut buckets = Self::reserve_buckets(env, merchant);
+        buckets.push_back(ReserveBucket {
+            token: token.clone(),
+            amount: hold,
+            held_at_ledger: now,
+            release_ledger,
+        });
+        Self::save_reserve_buckets(env, merchant, &buckets);
+        events::emit_rolling_reserve_held(env, merchant.clone(), token.clone(), hold, release_ledger);
+        hold
+    }
+
+    /// #1051: removes `amount` of `token` from the merchant's reserve buckets,
+    /// oldest first. Panics with `InsufficientRollingReserve` if the reserve
+    /// holds less than `amount`.
+    fn draw_rolling_reserve(env: &Env, merchant: &Address, token: &Address, amount: i128) {
+        let buckets = Self::reserve_buckets(env, merchant);
+        let mut kept: Vec<ReserveBucket> = Vec::new(env);
+        let mut outstanding = amount;
+        for mut bucket in buckets.iter() {
+            if outstanding > 0 && bucket.token == *token {
+                let take = bucket.amount.min(outstanding);
+                bucket.amount -= take;
+                outstanding -= take;
+            }
+            if bucket.amount > 0 {
+                kept.push_back(bucket);
+            }
+        }
+        if outstanding > 0 {
+            panic_with_error!(env, ExtError::InsufficientRollingReserve);
+        }
+        Self::save_reserve_buckets(env, merchant, &kept);
+    }
+
     /// Validates that a token is allowed via the whitelist contract
     fn require_token_allowed(env: &Env, token: &Address) {
         if let Some(whitelist_contract) = env
@@ -7322,7 +7847,21 @@ impl AhjoorPaymentsContract {
             Self::accrue_referral_commission(env, &payment.merchant, payment_id, fee_amount);
         }
 
-        let split_transfers = Self::distribute_net_payment(env, payment, net_amount);
+        // #1051: hold the merchant's rolling reserve share back on contract.
+        // Payments split across recipients are not the merchant's alone, so
+        // they are not held.
+        let has_split_recipients = payment
+            .split_recipients
+            .as_ref()
+            .map(|splits| splits.len() > 0)
+            .unwrap_or(false);
+        let reserve_hold = if has_split_recipients {
+            0
+        } else {
+            Self::hold_rolling_reserve(env, &payment.merchant, &payment.token, net_amount)
+        };
+
+        let split_transfers = Self::distribute_net_payment(env, payment, net_amount - reserve_hold);
         if split_transfers.len() > 0 {
             events::emit_payment_split_completed(env, payment_id, split_transfers);
         }
@@ -11597,6 +12136,12 @@ mod test_subscription_v2;
 
 #[cfg(test)]
 mod test_cross_token_invoice;
+
+#[cfg(test)]
+mod test_rolling_reserve;
+
+#[cfg(test)]
+mod test_payout_address_rotation;
 
 #[cfg(test)]
 mod test;

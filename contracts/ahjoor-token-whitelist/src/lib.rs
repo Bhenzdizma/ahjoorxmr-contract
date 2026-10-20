@@ -43,6 +43,10 @@ pub enum Error {
     TokenAlreadyDeprecated = 11,
     TokenNotDeprecated = 12,
     InvalidSunsetLedger = 13,
+    RemovalAlreadyScheduled = 14,
+    RemovalNotScheduled = 15,
+    RemovalNotYetActive = 16,
+    InvalidCategory = 17,
 }
 
 #[contracttype]
@@ -118,6 +122,34 @@ pub struct TokenDeprecation {
     pub sunset_ledger: u32,
 }
 
+/// Timelocked removal request for a token. Allows admin to schedule token
+/// removal with a delay period, during which the removal can be cancelled.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenRemovalRequest {
+    pub token: Address,
+    pub scheduled_at_ledger: u32,
+    pub removal_ledger: u32,
+    pub requester: Address,
+    pub reason_hash: BytesN<32>,
+}
+
+/// Token category for organizing and filtering tokens
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenCategory {
+    Stablecoin = 1,
+    Native = 2,
+    Wrapped = 3,
+    Governance = 4,
+    Utility = 5,
+    Synthetic = 6,
+    Collateral = 7,
+    Yield = 8,
+    Bridged = 9,
+    Other = 10,
+}
+
 /// Result of a contract-level allowlist lookup.
 ///
 /// Not represented as `Option<Option<u32>>`: the SDK's blanket `Option<T>`
@@ -175,6 +207,14 @@ pub enum DataKey {
     /// on contracts initialized before this key existed, in which case the
     /// read is always performed.
     DeprecatedTokenCount,
+    /// Timelocked token removal request for a given token
+    TokenRemovalRequest(Address),
+    /// Category assigned to a token for filtering and organization
+    TokenCategory(Address),
+    /// Index of tokens by category: (category, sequential_index) -> token
+    CategoryTokenList(TokenCategory, u32),
+    /// Count of tokens in each category
+    CategoryTokenCount(TokenCategory),
 }
 
 #[contracttype]
@@ -486,6 +526,48 @@ impl TokenWhitelistContract {
             return false;
         }
         !env.storage().persistent().has(&DataKey::TokenDeprecation(token))
+    }
+
+    /// Combined usability check: returns `true` only if the token is whitelisted,
+    /// not suspended, not deprecated, and passes quota checks (if configured).
+    /// This is the most comprehensive check for whether a token can be used
+    /// in a new transaction or position.
+    pub fn is_token_usable(env: Env, token: Address) -> bool {
+        // First check basic allowance (whitelist + suspension)
+        if !Self::is_token_allowed(env.clone(), token.clone()) {
+            return false;
+        }
+        
+        // Check deprecation status
+        if env.storage().persistent().has(&DataKey::TokenDeprecation(token.clone())) {
+            return false;
+        }
+        
+        // Check if token has quota restrictions and if they're exceeded
+        let quota_key = DataKey::TokenQuota(token.clone());
+        if let Some(quota) = env.storage().persistent().get::<_, TokenQuota>(&quota_key) {
+            let current_ledger = env.ledger().sequence();
+            let bucket_span = quota.period_ledgers / VOLUME_AGG_BUCKET_COUNT;
+            let current_bucket_id = current_ledger / bucket_span;
+            
+            let mut total_volume: i128 = 0;
+            for slot_idx in 0..VOLUME_AGG_BUCKET_COUNT {
+                let key = DataKey::TokenVolumeAggBucket(token.clone(), slot_idx);
+                if let Some(bucket) = env.storage().persistent().get::<_, VolumeAggBucket>(&key) {
+                    if current_bucket_id >= bucket.bucket_id 
+                        && current_bucket_id - bucket.bucket_id < VOLUME_AGG_BUCKET_COUNT {
+                        total_volume = total_volume.saturating_add(bucket.volume);
+                    }
+                }
+            }
+            
+            // If quota is already exceeded, token is not usable
+            if total_volume >= quota.max_volume_per_period {
+                return false;
+            }
+        }
+        
+        true
     }
 
     /// Marks a whitelisted token as deprecated. The token is rejected by
@@ -1444,5 +1526,285 @@ impl TokenWhitelistContract {
     /// voter's live token balance later changes.
     pub fn get_vote_weight_snapshot(env: Env, proposal_id: u32, voter: Address) -> Option<i128> {
         env.storage().persistent().get(&DataKey::VoteWeightSnapshot(proposal_id, voter))
+    }
+
+    // ==================== TIMELOCKED TOKEN REMOVAL ====================
+
+    /// Schedule a token removal with a timelock. The token will be eligible for
+    /// removal after `removal_delay_ledgers` have passed. During this period,
+    /// the removal can be cancelled. Admin-gated.
+    pub fn schedule_token_removal(
+        env: Env,
+        admin: Address,
+        token: Address,
+        removal_delay_ledgers: u32,
+        reason_hash: BytesN<32>,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        
+        if !env.storage().persistent().has(&DataKey::WhitelistMembership(token.clone())) {
+            panic!("Token not whitelisted");
+        }
+        
+        let removal_key = DataKey::TokenRemovalRequest(token.clone());
+        if env.storage().persistent().has(&removal_key) {
+            panic!("Removal already scheduled");
+        }
+        
+        let current_ledger = env.ledger().sequence();
+        let removal_ledger = current_ledger + removal_delay_ledgers;
+        
+        let removal_request = TokenRemovalRequest {
+            token: token.clone(),
+            scheduled_at_ledger: current_ledger,
+            removal_ledger,
+            requester: admin.clone(),
+            reason_hash: reason_hash.clone(),
+        };
+        
+        env.storage().persistent().set(&removal_key, &removal_request);
+        env.storage().persistent().extend_ttl(
+            &removal_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        
+        events::emit_token_removal_scheduled(&env, token, admin, removal_ledger, reason_hash);
+    }
+
+    /// Cancel a scheduled token removal before it becomes active. Admin-gated.
+    pub fn cancel_token_removal(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        
+        let removal_key = DataKey::TokenRemovalRequest(token.clone());
+        let removal_request: TokenRemovalRequest = env
+            .storage().persistent()
+            .get(&removal_key)
+            .expect("Removal not scheduled");
+        
+        let current_ledger = env.ledger().sequence();
+        if current_ledger >= removal_request.removal_ledger {
+            panic!("Removal already active, cannot cancel");
+        }
+        
+        env.storage().persistent().remove(&removal_key);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        
+        events::emit_token_removal_cancelled(&env, token, admin);
+    }
+
+    /// Execute a scheduled token removal once the timelock has expired.
+    /// Permissionless: anyone can call this after the removal_ledger is reached.
+    pub fn execute_token_removal(env: Env, token: Address) {
+        let removal_key = DataKey::TokenRemovalRequest(token.clone());
+        let removal_request: TokenRemovalRequest = env
+            .storage().persistent()
+            .get(&removal_key)
+            .expect("Removal not scheduled");
+        
+        let current_ledger = env.ledger().sequence();
+        if current_ledger < removal_request.removal_ledger {
+            panic!("Removal not yet active");
+        }
+        
+        // Remove the token
+        Self::delist_token_storage(&env, &token);
+        
+        // Remove the removal request
+        env.storage().persistent().remove(&removal_key);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        
+        events::emit_token_removed_via_timelock(&env, token, removal_request.requester);
+    }
+
+    /// Get the scheduled removal request for a token, if any.
+    pub fn get_token_removal_request(env: Env, token: Address) -> Option<TokenRemovalRequest> {
+        env.storage().persistent().get(&DataKey::TokenRemovalRequest(token))
+    }
+
+    // ==================== TOKEN CATEGORY TAGS ====================
+
+    /// Assign a category to a whitelisted token for filtering and organization. Admin-gated.
+    pub fn assign_token_category(
+        env: Env,
+        admin: Address,
+        token: Address,
+        category: TokenCategory,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        
+        if !env.storage().persistent().has(&DataKey::WhitelistMembership(token.clone())) {
+            panic!("Token not whitelisted");
+        }
+        
+        // Get old category if exists
+        let old_category: Option<TokenCategory> = env
+            .storage().persistent()
+            .get(&DataKey::TokenCategory(token.clone()));
+        
+        // If changing category, remove from old category list
+        if let Some(old_cat) = old_category {
+            if old_cat != category {
+                Self::remove_token_from_category_list(&env, &token, old_cat);
+            }
+        }
+        
+        // Set new category
+        env.storage().persistent().set(&DataKey::TokenCategory(token.clone()), &category);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenCategory(token.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        
+        // Add to new category list if not already there
+        if old_category != Some(category) {
+            Self::add_token_to_category_list(&env, &token, category);
+        }
+        
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_token_category_assigned(&env, token, category);
+    }
+
+    /// Remove category assignment from a token. Admin-gated.
+    pub fn remove_token_category(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        
+        let category_key = DataKey::TokenCategory(token.clone());
+        let category: TokenCategory = env
+            .storage().persistent()
+            .get(&category_key)
+            .expect("Token has no category assigned");
+        
+        Self::remove_token_from_category_list(&env, &token, category);
+        env.storage().persistent().remove(&category_key);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        
+        events::emit_token_category_removed(&env, token);
+    }
+
+    /// Get the category assigned to a token, if any.
+    pub fn get_token_category(env: Env, token: Address) -> Option<TokenCategory> {
+        env.storage().persistent().get(&DataKey::TokenCategory(token))
+    }
+
+    /// Get all tokens in a specific category with pagination.
+    pub fn get_tokens_by_category(
+        env: Env,
+        category: TokenCategory,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Address> {
+        let count: u32 = env
+            .storage().instance()
+            .get(&DataKey::CategoryTokenCount(category))
+            .unwrap_or(0);
+        
+        let start = offset.min(count);
+        let l = limit.min(DEFAULT_WHITELIST_PAGE_SIZE).min(count - start);
+        
+        let mut tokens = Vec::new(&env);
+        for i in start..start + l {
+            if let Some(token) = env
+                .storage().persistent()
+                .get::<_, Address>(&DataKey::CategoryTokenList(category, i))
+            {
+                tokens.push_back(token);
+            }
+        }
+        
+        tokens
+    }
+
+    /// Get the count of tokens in a specific category.
+    pub fn get_category_token_count(env: Env, category: TokenCategory) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CategoryTokenCount(category))
+            .unwrap_or(0)
+    }
+
+    // ==================== HELPER FUNCTIONS ====================
+
+    /// Add a token to a category list (internal helper).
+    fn add_token_to_category_list(env: &Env, token: &Address, category: TokenCategory) {
+        let count: u32 = env
+            .storage().instance()
+            .get(&DataKey::CategoryTokenCount(category))
+            .unwrap_or(0);
+        
+        // Add token at the end of the list
+        let list_key = DataKey::CategoryTokenList(category, count);
+        env.storage().persistent().set(&list_key, token);
+        env.storage().persistent().extend_ttl(
+            &list_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        
+        // Increment count
+        env.storage().instance().set(&DataKey::CategoryTokenCount(category), &(count + 1));
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Remove a token from a category list (internal helper).
+    /// Uses swap-and-pop to maintain O(1) removal.
+    fn remove_token_from_category_list(env: &Env, token: &Address, category: TokenCategory) {
+        let count: u32 = env
+            .storage().instance()
+            .get(&DataKey::CategoryTokenCount(category))
+            .unwrap_or(0);
+        
+        if count == 0 {
+            return;
+        }
+        
+        // Find the token's index
+        let mut found_idx: Option<u32> = None;
+        for i in 0..count {
+            if let Some(t) = env
+                .storage().persistent()
+                .get::<_, Address>(&DataKey::CategoryTokenList(category, i))
+            {
+                if t == *token {
+                    found_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        
+        if let Some(idx) = found_idx {
+            let last_idx = count - 1;
+            
+            // If not the last element, swap with last
+            if idx != last_idx {
+                if let Some(last_token) = env
+                    .storage().persistent()
+                    .get::<_, Address>(&DataKey::CategoryTokenList(category, last_idx))
+                {
+                    env.storage().persistent().set(
+                        &DataKey::CategoryTokenList(category, idx),
+                        &last_token,
+                    );
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::CategoryTokenList(category, idx),
+                        PERSISTENT_LIFETIME_THRESHOLD,
+                        PERSISTENT_BUMP_AMOUNT,
+                    );
+                }
+            }
+            
+            // Remove the last element
+            env.storage().persistent().remove(&DataKey::CategoryTokenList(category, last_idx));
+            
+            // Decrement count
+            env.storage().instance().set(&DataKey::CategoryTokenCount(category), &last_idx);
+            env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        }
     }
 }
